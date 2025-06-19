@@ -1,3 +1,5 @@
+// cmd/tickssched/main.go
+
 package main
 
 import (
@@ -10,48 +12,44 @@ import (
 )
 
 func main() {
-	// Read the configuration
+	// load config & build scheduler
 	cfg := sched.Load("config.yml")
 	fmt.Printf("Loaded config: %+v\n", cfg)
 	scheduler := sched.New(cfg)
 
-	// Start the new scheduler loop
+	// prepare cancelable context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go scheduler.Loop(ctx)
 
-	// helper to sleep N ticks
+	// start the scheduler + printer
+	go func() {
+		if err := scheduler.Run(ctx); err != nil {
+			fmt.Println("Scheduler exited with:", err)
+		}
+	}()
+
+	// helpers to convert ticks <-> real time
 	sleepTicks := func(n int64) {
 		time.Sleep(time.Duration(n*int64(cfg.TickMS)) * time.Millisecond)
 	}
-
-	// calculate ticks -> msec
-	calculateTicks := func(ticks int64) int64 {
+	calcMS := func(ticks int64) int64 {
 		return ticks * int64(cfg.TickMS)
 	}
 
-	// Task A @ tick 10, priority 3, total required ticks 5
+	// dynamically add tasks
 	sleepTicks(10)
-	taskA := sched.NewTask(1, 3, job.SleepWork(calculateTicks(5)))
-	scheduler.Add(taskA)
-	fmt.Printf("Added Task A (ID: %d, Priority: %d) at tick 10\n", taskA.ID, taskA.Priority)
+	scheduler.Add(sched.NewTask(1, 3, job.SleepWork(calcMS(5))))
 
-	// Task B @ tick 14, priority 8, total required ticks 10
 	sleepTicks(4)
-	taskB := sched.NewTask(2, 8, job.SleepWork(calculateTicks(10)))
-	scheduler.Add(taskB)
-	fmt.Printf("Added Task B (ID: %d, Priority: %d) at tick 14\n", taskB.ID, taskB.Priority)
+	scheduler.Add(sched.NewTask(2, 8, job.SleepWork(calcMS(10))))
 
-	// Task C @ tick 15, priority 10, total required ticks 8
 	sleepTicks(1)
-	taskC := sched.NewTask(3, 10, job.SleepWork(calculateTicks(8)))
-	scheduler.Add(taskC)
-	fmt.Printf("Added Task C (ID: %d, Priority: %d) at tick 15\n", taskC.ID, taskC.Priority)
+	scheduler.Add(sched.NewTask(3, 10, job.SleepWork(calcMS(8))))
 
-	// let it run for a few seconds
-	time.Sleep(5 * time.Second)
-
-	// spin down
+	// let it run for a bit, then stop
+	sleepTicks(100)
 	cancel()
+
+	time.Sleep(100 * time.Millisecond)
 	fmt.Println("Scheduler stopped.")
 }

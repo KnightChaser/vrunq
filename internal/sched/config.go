@@ -1,3 +1,5 @@
+// internal/sched/config.go
+
 package sched
 
 import (

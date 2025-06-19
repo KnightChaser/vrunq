@@ -1,3 +1,5 @@
+// internal/sched/consts.go
+
 package sched
 
 const (
