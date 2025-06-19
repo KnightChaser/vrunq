@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emirpasic/gods/trees/redblacktree"
@@ -13,6 +14,7 @@ import (
 
 // Scheduler implements a mini CFS‑like scheduler and streams state changes.
 type Scheduler struct {
+	mu           sync.Mutex         // protects the scheduler state
 	sliceTicks   int64              // number of ticks to run a task before preempting (minimum guaranteed time slice)
 	tickDuration time.Duration      // duration of a single tick in real time
 	minVruntime  float64            // minimum vruntime of all tasks in the run queue
@@ -30,6 +32,7 @@ func New(cfg Config) *Scheduler {
 		rbt:          redblacktree.NewWith(cmp),
 		tasks:        make(map[TaskID]*Task),
 		ranTotals:    make(map[TaskID]int64),
+		statusCh:     make(chan StatusEvent, 256),
 	}
 }
 
@@ -40,8 +43,6 @@ func (s *Scheduler) StatusChannel() <-chan StatusEvent { return s.statusCh }
 // A ticker goroutine generates StatusTick events each real-time tick so the
 // global tick counter advances even while the run queue is empty.
 func (s *Scheduler) Run(ctx context.Context) error {
-	s.statusCh = make(chan StatusEvent, 256)
-
 	// generate tick events
 	go func() {
 		ticker := time.NewTicker(s.tickDuration)
@@ -70,18 +71,61 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 // Add enqueues a task and emits a StatusEnqueue event.
 func (s *Scheduler) Add(t *Task) error {
+	s.mu.Lock()
+
 	if _, dup := s.tasks[t.ID]; dup {
+		s.mu.Unlock()
 		return fmt.Errorf("task %d already exists", t.ID)
 	}
+
 	t.Vruntime = s.minVruntime
 	s.rbt.Put(nodeKey{t.Vruntime, t.ID}, t)
 	s.tasks[t.ID] = t
 	s.ranTotals[t.ID] = 0
-	s.statusCh <- StatusEvent{
+
+	eventData := StatusEvent{
 		Time:     time.Now(),
 		Kind:     StatusEnqueue,
 		TaskID:   t.ID,
 		Vruntime: t.Vruntime}
+	s.mu.Unlock() // NOTE: Unlock before sending to avoid deadlock if the channel is full
+	s.statusCh <- eventData
+	return nil
+}
+
+// AdjustPriority changes an existing task's priority on the fly.
+// It reweights and requeues the task so future silces reflect the new priority.
+func (s *Scheduler) AdjustPriority(id TaskID, newPriority int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t, ok := s.tasks[id]
+	if !ok {
+		return fmt.Errorf("no such task %d", id)
+	}
+
+	if newPriority <= MinPriority {
+		newPriority = MinPriority
+	} else if newPriority >= MaxPriority {
+		newPriority = MaxPriority
+	}
+
+	// Remove old tree entry, update fields, then reinsert the task
+	// under the same vruntime. And emit an event so logs show the change.
+	s.rbt.Remove(nodeKey{t.Vruntime, t.ID})
+	t.Priority = newPriority
+	t.Weight = float64(newPriority + 1)
+	s.rbt.Put(nodeKey{
+		vruntime: t.Vruntime,
+		id:       t.ID,
+	}, t)
+
+	s.statusCh <- StatusEvent{
+		Time:     time.Now(),
+		Kind:     StatusPriorityUpdate,
+		TaskID:   t.ID,
+		Vruntime: t.Vruntime,
+	}
 	return nil
 }
 
@@ -95,9 +139,11 @@ func (s *Scheduler) loop(ctx context.Context) {
 		}
 
 		// Check if we have any tasks to run.
+		s.mu.Lock() // NOTE: protect the red-black tree and tasks map for stable reads
 		node := s.rbt.Left()
 		if node == nil {
 			// No task, nap for a tick and continue.
+			s.mu.Unlock() // NOTE: release the lock before sleeping to avoid deadlock
 			time.Sleep(s.tickDuration)
 			continue
 		}
@@ -106,6 +152,8 @@ func (s *Scheduler) loop(ctx context.Context) {
 		key := node.Key.(nodeKey)
 		t := node.Value.(*Task)
 		s.rbt.Remove(key)
+		s.minVruntime = key.vruntime
+		s.mu.Unlock() // NOTE: release the lock before running the task
 		s.statusCh <- StatusEvent{
 			Time:     time.Now(),
 			Kind:     StatusDispatch,
@@ -120,9 +168,11 @@ func (s *Scheduler) loop(ctx context.Context) {
 
 		ranTicks := int64(time.Since(start) / s.tickDuration)
 		if ranTicks <= 0 {
-			// Evnt if the task did not run, we still need to update vruntime.
-			ranTicks = s.sliceTicks
+			// Ensure vruntime always advances at least by 1 tick.
+			ranTicks = 1
 		}
+
+		s.mu.Lock() // NOTE: re-acquire the lock to update the task state
 		t.Vruntime += float64(ranTicks) / t.Weight
 		s.ranTotals[t.ID] += ranTicks
 
@@ -136,6 +186,14 @@ func (s *Scheduler) loop(ctx context.Context) {
 			// because we consider it was preempted (more time was needed).
 			s.rbt.Put(nodeKey{t.Vruntime, t.ID}, t)
 		}
+
+		// Update the minimum vruntime after running a task.
+		if first := s.rbt.Left(); first != nil {
+			s.minVruntime = first.Key.(nodeKey).vruntime
+		}
+
+		s.mu.Unlock() // NOTE: release the lock after updating the task state
+
 		s.statusCh <- StatusEvent{
 			Time:     time.Now(),
 			Kind:     kind,
@@ -143,10 +201,6 @@ func (s *Scheduler) loop(ctx context.Context) {
 			Vruntime: t.Vruntime,
 			RanTicks: ranTicks}
 
-		// Update the minimum vruntime after running a task.
-		if first := s.rbt.Left(); first != nil {
-			s.minVruntime = first.Key.(nodeKey).vruntime
-		}
 	}
 }
 
@@ -168,7 +222,7 @@ func (s *Scheduler) handleEvent(ev StatusEvent) {
 	fmt.Printf("%s = Tick: %07d [%s] => Task: %04d, Total ran: %04d ticks, vruntime=%07.4f\n",
 		ev.Time.Format("Jan 02 15:04:05.000"),
 		s.tickCount,
-		center(ev.Kind.String(), 10),
+		center(ev.Kind.String(), 16),
 		ev.TaskID,
 		s.ranTotals[ev.TaskID],
 		ev.Vruntime,

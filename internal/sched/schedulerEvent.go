@@ -13,6 +13,7 @@ const (
 	StatusIdle StatusKind = iota
 	StatusEnqueue
 	StatusDispatch
+	StatusPriorityUpdate
 	StatusPreempt
 	StatusFinish
 	StatusTick
@@ -35,6 +36,8 @@ func (sk StatusKind) String() string {
 		return "Enqueued"
 	case StatusDispatch:
 		return "Dispatch"
+	case StatusPriorityUpdate:
+		return "PriorityUpdate"
 	case StatusPreempt:
 		return "Preempt"
 	case StatusFinish:

@@ -36,17 +36,25 @@ func main() {
 		return ticks * int64(cfg.TickMS)
 	}
 
-	// dynamically add tasks
-	sleepTicks(10)
-	scheduler.Add(sched.NewTask(1, 3, job.SleepWork(calcMS(5))))
+	// 1) T1 @ tick0 (30 ticks of work at prio=5)
+	scheduler.Add(sched.NewTask(1, 5, job.SleepWork(calcMS(30))))
+	sleepTicks(5)
 
-	sleepTicks(4)
-	scheduler.Add(sched.NewTask(2, 8, job.SleepWork(calcMS(10))))
+	// 2) T2 @ tick5 (25 ticks at prio=2)
+	scheduler.Add(sched.NewTask(2, 2, job.SleepWork(calcMS(25))))
+	sleepTicks(3)
 
-	sleepTicks(1)
-	scheduler.Add(sched.NewTask(3, 10, job.SleepWork(calcMS(8))))
+	// 3) T3 @ tick8 (20 ticks at prio=10 → then demote to prio=1)
+	scheduler.Add(sched.NewTask(3, 10, job.SleepWork(calcMS(20))))
+	scheduler.AdjustPriority(3, 1)
+	sleepTicks(5)
 
-	// let it run for a bit, then stop
+	//  4. After T2’s first preempt (should happen at tick ~10), boost T2
+	//     You can approximate: wait another 5 ticks
+	sleepTicks(5)
+	scheduler.AdjustPriority(2, 20)
+
+	// 5) Drain the rest
 	sleepTicks(100)
 	cancel()
 
