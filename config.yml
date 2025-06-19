@@ -1,8 +1,5 @@
-# ticks in milliseconds (e.g., 5 ms = 200 Hz)
-tick_ms: 5
+# ticks in milliseconds (e.g., 100 ms = 10 Hz)
+tick_ms: 100
 
 # max ticks a task may hold a CPU before being preempted (re-queued)
 slice_ticks: 5
-
-# aging boost applied per wait-tick (smaller = slower aging)
-alpha: 0.01

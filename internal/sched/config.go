@@ -8,9 +8,8 @@ import (
 
 // config mirros config.yaml
 type Config struct {
-	TickMS     int     `yaml:"tick_ms"`     // 5 (by default)
-	SliceTicks int     `yaml:"slice_ticks"` // 5 (by default)
-	Alpha      float64 `yaml:"alpha"`       // 0.5 (by default)
+	TickMS     int `yaml:"tick_ms"`     // 5 (by default)
+	SliceTicks int `yaml:"slice_ticks"` // 5 (by default)
 }
 
 // If the config file is not found, we use default values
@@ -18,7 +17,6 @@ func defaultConfig() Config {
 	return Config{
 		TickMS:     5,
 		SliceTicks: 5,
-		Alpha:      0.01,
 	}
 }
 
@@ -37,9 +35,6 @@ func Load(path string) Config {
 	_ = yaml.Unmarshal(data, &cfg)
 
 	// sanity clamps
-	if cfg.Alpha <= 0 {
-		cfg.Alpha = 0.01
-	}
 	if cfg.SliceTicks <= 0 {
 		cfg.SliceTicks = 5
 	}
