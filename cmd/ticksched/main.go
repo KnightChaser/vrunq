@@ -16,6 +16,7 @@ func main() {
 	cfg := sched.Load("config.yml")
 	fmt.Printf("Loaded config: %+v\n", cfg)
 	scheduler := sched.New(cfg)
+	scheduler.EnableCSVLogging("events.csv")
 
 	// prepare cancelable context
 	ctx, cancel := context.WithCancel(context.Background())

@@ -4,7 +4,10 @@ package sched
 
 import (
 	"context"
+	"encoding/csv"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +17,7 @@ import (
 
 // Scheduler implements a mini CFS‑like scheduler and streams state changes.
 type Scheduler struct {
+	// Scheduler-related
 	mu           sync.Mutex         // protects the scheduler state
 	sliceTicks   int64              // number of ticks to run a task before preempting (minimum guaranteed time slice)
 	tickDuration time.Duration      // duration of a single tick in real time
@@ -23,6 +27,10 @@ type Scheduler struct {
 	statusCh     chan StatusEvent   // channel for status events
 	tickCount    int64              // wall‑clock ticks since Run() started
 	ranTotals    map[TaskID]int64   // cumulative ticks per task
+
+	// logging-related
+	csvFile   *os.File
+	csvWriter *csv.Writer
 }
 
 func New(cfg Config) *Scheduler {
@@ -34,6 +42,23 @@ func New(cfg Config) *Scheduler {
 		ranTotals:    make(map[TaskID]int64),
 		statusCh:     make(chan StatusEvent, 256),
 	}
+}
+
+// EnableCSVLogging opens the given file path for CSV logging of events.
+// Must be called before Run().
+func (s *Scheduler) EnableCSVLogging(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	w := csv.NewWriter(f)
+
+	// write header
+	w.Write([]string{"timestamp", "tick", "event", "task_id", "ran_ticks", "vruntime"})
+	w.Flush()
+	s.csvFile = f
+	s.csvWriter = w
+	return nil
 }
 
 // StatusChannel exposes read‑only stream (optional consumers).
@@ -66,6 +91,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	for ev := range s.statusCh {
 		s.handleEvent(ev)
 	}
+
+	// close CSV file if logging is enabled
+	if s.csvFile != nil {
+		s.csvWriter.Flush()
+		s.csvFile.Close()
+	}
+
 	return nil
 }
 
@@ -219,7 +251,7 @@ func (s *Scheduler) handleEvent(ev StatusEvent) {
 		return strings.Repeat(" ", spaces) + str + strings.Repeat(" ", width-(spaces+len(str)))
 	}
 
-	fmt.Printf("%s = Tick: %07d [%s] => Task: %04d, Total ran: %04d ticks, vruntime=%07.4f\n",
+	msg := fmt.Sprintf("%s = Tick: %07d [%s] => Task: %04d, Total ran: %04d ticks, vruntime=%07.4f",
 		ev.Time.Format("Jan 02 15:04:05.000"),
 		s.tickCount,
 		center(ev.Kind.String(), 16),
@@ -227,6 +259,21 @@ func (s *Scheduler) handleEvent(ev StatusEvent) {
 		s.ranTotals[ev.TaskID],
 		ev.Vruntime,
 	)
+	fmt.Println(msg)
+
+	// CSV output
+	if s.csvWriter != nil {
+		rec := []string{
+			ev.Time.Format(time.RFC3339Nano),
+			strconv.FormatInt(s.tickCount, 10),
+			ev.Kind.String(),
+			strconv.FormatInt(int64(ev.TaskID), 10),
+			strconv.FormatInt(ev.RanTicks, 10),
+			fmt.Sprintf("%.4f", ev.Vruntime),
+		}
+		s.csvWriter.Write(rec)
+		s.csvWriter.Flush()
+	}
 }
 
 // nodeKey is used as a key in the red-black tree.

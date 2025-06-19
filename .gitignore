@@ -33,3 +33,6 @@ go.work.sum
 
 # repomix
 repomix-output.xml
+
+# log output
+*.csv
