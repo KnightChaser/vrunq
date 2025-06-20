@@ -69,7 +69,7 @@ func main() {
 	scheduler.AdjustPriority(5, 8) // Boost T5
 
 	// 5) Drain the rest
-	sleepTicks(300)
+	sleepTicks(150)
 	cancel()
 
 	time.Sleep(100 * time.Millisecond)

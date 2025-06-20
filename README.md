@@ -1,5 +1,8 @@
 # vrunq
 
+### Note
+The following Mermaid sequence charts at `Mechanisms` may be updated to reflect the latest commit.
+
 ### Mechanisms
 
 1. `Run(ctx context.Context)`

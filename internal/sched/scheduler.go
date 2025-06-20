@@ -18,29 +18,32 @@ import (
 // Scheduler implements a mini CFS‑like scheduler and streams state changes.
 type Scheduler struct {
 	// Scheduler-related
-	mu           sync.Mutex         // protects the scheduler state
-	sliceTicks   int64              // number of ticks to run a task before preempting (minimum guaranteed time slice)
-	tickDuration time.Duration      // duration of a single tick in real time
-	minVruntime  float64            // minimum vruntime of all tasks in the run queue
-	rbt          *redblacktree.Tree // red-black tree ordered by vruntime and task ID
-	tasks        map[TaskID]*Task   // map of all tasks by ID
-	statusCh     chan StatusEvent   // channel for status events
-	tickCount    int64              // wall‑clock ticks since Run() started
-	ranTotals    map[TaskID]int64   // cumulative ticks per task
+	mu          sync.Mutex         // protects the scheduler state
+	sliceTicks  int64              // number of ticks to run a task before preempting (minimum guaranteed time slice)
+	clock       *TickClock         // clock for generating ticks
+	minVruntime float64            // minimum vruntime of all tasks in the run queue
+	rbt         *redblacktree.Tree // red-black tree ordered by vruntime and task ID
+	tasks       map[TaskID]*Task   // map of all tasks by ID
+	statusCh    chan StatusEvent   // channel for status events
+	ranTotals   map[TaskID]int64   // cumulative ticks per task
 
 	// logging-related
 	csvFile   *os.File
 	csvWriter *csv.Writer
 }
 
+// New creates a new Scheduler instance with the given configuration.
 func New(cfg Config) *Scheduler {
+	clock := NewTickClock(256) // buffer size for tick events
+	clock.Start(time.Duration(cfg.TickMS) * time.Millisecond)
+
 	return &Scheduler{
-		sliceTicks:   int64(cfg.SliceTicks),
-		tickDuration: time.Duration(cfg.TickMS) * time.Millisecond,
-		rbt:          redblacktree.NewWith(cmp),
-		tasks:        make(map[TaskID]*Task),
-		ranTotals:    make(map[TaskID]int64),
-		statusCh:     make(chan StatusEvent, 256),
+		sliceTicks: int64(cfg.SliceTicks),
+		clock:      clock,
+		rbt:        redblacktree.NewWith(cmp),
+		tasks:      make(map[TaskID]*Task),
+		ranTotals:  make(map[TaskID]int64),
+		statusCh:   make(chan StatusEvent, 256), // buffered channel for status events
 	}
 }
 
@@ -64,35 +67,15 @@ func (s *Scheduler) EnableCSVLogging(path string) error {
 // StatusChannel exposes read‑only stream (optional consumers).
 func (s *Scheduler) StatusChannel() <-chan StatusEvent { return s.statusCh }
 
-// Run starts dispatch loop and prints every status event in unified format.
-// A ticker goroutine generates StatusTick events each real-time tick so the
-// global tick counter advances even while the run queue is empty.
 func (s *Scheduler) Run(ctx context.Context) error {
-	// generate tick events
-	go func() {
-		ticker := time.NewTicker(s.tickDuration)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case t := <-ticker.C:
-				s.statusCh <- StatusEvent{
-					Time: t,
-					Kind: StatusTick}
-			}
-		}
-	}()
-
-	// start core dispatch loop
+	// start loop
 	go s.loop(ctx)
 
-	// consume and log events
+	// consume events
 	for ev := range s.statusCh {
 		s.handleEvent(ev)
 	}
 
-	// close CSV file if logging is enabled
 	if s.csvFile != nil {
 		s.csvWriter.Flush()
 		s.csvFile.Close()
@@ -163,89 +146,115 @@ func (s *Scheduler) AdjustPriority(id TaskID, newPriority int) error {
 
 // loop runs the main dispatch loop, which is responsible for selecting the next task
 func (s *Scheduler) loop(ctx context.Context) {
-	defer close(s.statusCh)
+	defer func() {
+		// stop the underlyinig clock to release its goroutine
+		s.clock.Stop()
+		close(s.statusCh)
+	}()
 
 	for {
+		// 1) check shutdown
 		if ctx.Err() != nil {
 			return
 		}
 
-		// Check if we have any tasks to run.
-		s.mu.Lock() // NOTE: protect the red-black tree and tasks map for stable reads
+		// 2) idle case: if no tasks in queue, still emit a tick
+		s.mu.Lock()
 		node := s.rbt.Left()
 		if node == nil {
-			// No task, nap for a tick and continue.
-			s.mu.Unlock() // NOTE: release the lock before sleeping to avoid deadlock
-			time.Sleep(s.tickDuration)
+			s.mu.Unlock()
+			// drive one tick
+			<-s.clock.Ch
+			s.statusCh <- StatusEvent{
+				Time: time.Now(),
+				Kind: StatusTick,
+			}
 			continue
 		}
 
-		// If we have tasks, we run the one with the lowest vruntime.
+		// 3) dispatch next task
 		key := node.Key.(nodeKey)
 		t := node.Value.(*Task)
 		s.rbt.Remove(key)
 		s.minVruntime = key.vruntime
-		s.mu.Unlock() // NOTE: release the lock before running the task
+		s.mu.Unlock()
+
+		// emit dispatch event
 		s.statusCh <- StatusEvent{
 			Time:     time.Now(),
 			Kind:     StatusDispatch,
 			TaskID:   t.ID,
-			Vruntime: t.Vruntime}
+			Vruntime: t.Vruntime,
+		}
 
-		// run one slice
-		runCtx, cancel := context.WithTimeout(ctx, time.Duration(s.sliceTicks)*s.tickDuration)
-		start := time.Now()
+		// 4) run exactly sliceTicks
+		startTick := s.clock.Count()
+		runCtx, cancel := context.WithCancel(ctx)
+		// watcher: cancel the dispatched context(task) after sliceTicks
+		go func() {
+			for i := int64(0); i < s.sliceTicks; i++ {
+				<-s.clock.Ch
+				s.statusCh <- StatusEvent{
+					Time: time.Now(),
+					Kind: StatusTick,
+				}
+			}
+			cancel() // cancel the run context after sliceTicks
+		}()
+
+		// While the watcher above is running, we can run the dispatched task.
 		err := t.Run(runCtx)
 		cancel()
 
-		ranTicks := int64(time.Since(start) / s.tickDuration)
+		// how many ticks did we really run?
+		ranTicks := s.clock.Count() - startTick
 		if ranTicks <= 0 {
-			// Ensure vruntime always advances at least by 1 tick.
 			ranTicks = 1
 		}
 
-		s.mu.Lock() // NOTE: re-acquire the lock to update the task state
+		// 5) update vruntime + requeue or finish
+		//    - If the task is preempted, the task exits with an error.
+		//    - If the task finishes voluntarily, it returns nil.
+		s.mu.Lock()
 		t.Vruntime += float64(ranTicks) / t.Weight
 		s.ranTotals[t.ID] += ranTicks
 
 		kind := StatusPreempt
 		if err == nil {
-			// If the task finished successfully, we remove it from the run queue.
 			kind = StatusFinish
 			delete(s.tasks, t.ID)
 		} else {
-			// The task was exited. We reinsert it into the run queue with updated vruntime,
-			// because we consider it was preempted (more time was needed).
-			s.rbt.Put(nodeKey{t.Vruntime, t.ID}, t)
+			s.rbt.Put(nodeKey{
+				vruntime: t.Vruntime,
+				id:       t.ID,
+			}, t)
 		}
 
-		// Update the minimum vruntime after running a task.
+		// also, update the minimum vruntime in the rbtree after requeueing
 		if first := s.rbt.Left(); first != nil {
 			s.minVruntime = first.Key.(nodeKey).vruntime
 		}
+		s.mu.Unlock()
 
-		s.mu.Unlock() // NOTE: release the lock after updating the task state
-
+		// 6) emit final event
 		s.statusCh <- StatusEvent{
 			Time:     time.Now(),
 			Kind:     kind,
 			TaskID:   t.ID,
 			Vruntime: t.Vruntime,
-			RanTicks: ranTicks}
-
+			RanTicks: ranTicks,
+		}
 	}
 }
 
 func (s *Scheduler) handleEvent(ev StatusEvent) {
-	switch ev.Kind {
-	case StatusTick:
-		// advance wall‑clock tick counter but do not print
-		s.tickCount++
+	// if we received a tick event which periodically occurs,
+	// we can just return early and not log it for the brevity of output.
+	if ev.Kind == StatusTick {
 		return
-	case StatusPreempt, StatusFinish:
-		// ranTotals already updated in loop; nothing extra
 	}
 
+	// an auxiliary function to center the event kind in the output
 	center := func(str string, width int) string {
 		spaces := int(float64(width-len(str)) / 2)
 		return strings.Repeat(" ", spaces) + str + strings.Repeat(" ", width-(spaces+len(str)))
@@ -253,7 +262,7 @@ func (s *Scheduler) handleEvent(ev StatusEvent) {
 
 	msg := fmt.Sprintf("%s = Tick: %07d [%s] => Task: %04d, Total ran: %04d ticks, vruntime=%07.4f",
 		ev.Time.Format("Jan 02 15:04:05.000"),
-		s.tickCount,
+		s.clock.Count(),
 		center(ev.Kind.String(), 16),
 		ev.TaskID,
 		s.ranTotals[ev.TaskID],
@@ -265,7 +274,7 @@ func (s *Scheduler) handleEvent(ev StatusEvent) {
 	if s.csvWriter != nil {
 		rec := []string{
 			ev.Time.Format(time.RFC3339Nano),
-			strconv.FormatInt(s.tickCount, 10),
+			strconv.FormatInt(s.clock.Count(), 10),
 			ev.Kind.String(),
 			strconv.FormatInt(int64(ev.TaskID), 10),
 			strconv.FormatInt(ev.RanTicks, 10),
