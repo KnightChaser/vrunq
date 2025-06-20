@@ -39,24 +39,37 @@ func main() {
 
 	// 1) T1 @ tick0 (30 ticks of work at prio=5)
 	scheduler.Add(sched.NewTask(1, 5, job.SleepWork(calcMS(30))))
-	sleepTicks(5)
+	sleepTicks(1)
 
-	// 2) T2 @ tick5 (25 ticks at prio=2)
+	// 2) T2 @ tick1 (25 ticks at prio=2)
 	scheduler.Add(sched.NewTask(2, 2, job.SleepWork(calcMS(25))))
-	sleepTicks(3)
+	sleepTicks(1)
 
-	// 3) T3 @ tick8 (20 ticks at prio=10 → then demote to prio=1)
+	// 3) T3 @ tick2 (20 ticks at prio=10)
 	scheduler.Add(sched.NewTask(3, 10, job.SleepWork(calcMS(20))))
-	scheduler.AdjustPriority(3, 1)
-	sleepTicks(5)
+	sleepTicks(1)
 
-	//  4. After T2’s first preempt (should happen at tick ~10), boost T2
-	//     You can approximate: wait another 5 ticks
-	sleepTicks(5)
-	scheduler.AdjustPriority(2, 20)
+	// 4) T4 @ tick3 (15 ticks at prio=7)
+	scheduler.Add(sched.NewTask(4, 7, job.SleepWork(calcMS(15))))
+	sleepTicks(1)
+
+	// 5) T5 @ tick4 (10 ticks at prio=3)
+	scheduler.Add(sched.NewTask(5, 3, job.SleepWork(calcMS(10))))
+	sleepTicks(2)
+
+	// Intermittently adjust priorities
+	scheduler.AdjustPriority(3, 1)  // Demote T3
+	sleepTicks(2)
+	scheduler.AdjustPriority(2, 15) // Boost T2
+	sleepTicks(2)
+	scheduler.AdjustPriority(4, 2)  // Demote T4
+	sleepTicks(2)
+	scheduler.AdjustPriority(1, 12) // Boost T1
+	sleepTicks(2)
+	scheduler.AdjustPriority(5, 8)  // Boost T5
 
 	// 5) Drain the rest
-	sleepTicks(100)
+	sleepTicks(300)
 	cancel()
 
 	time.Sleep(100 * time.Millisecond)
