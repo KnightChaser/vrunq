@@ -58,15 +58,15 @@ func main() {
 	sleepTicks(2)
 
 	// Intermittently adjust priorities
-	scheduler.AdjustPriority(3, 1)  // Demote T3
-	sleepTicks(2)
+	scheduler.AdjustPriority(3, 1) // Demote T3
+	sleepTicks(5)
 	scheduler.AdjustPriority(2, 15) // Boost T2
-	sleepTicks(2)
-	scheduler.AdjustPriority(4, 2)  // Demote T4
-	sleepTicks(2)
+	sleepTicks(10)
+	scheduler.AdjustPriority(4, 2) // Demote T4
+	sleepTicks(10)
 	scheduler.AdjustPriority(1, 12) // Boost T1
-	sleepTicks(2)
-	scheduler.AdjustPriority(5, 8)  // Boost T5
+	sleepTicks(10)
+	scheduler.AdjustPriority(5, 8) // Boost T5
 
 	// 5) Drain the rest
 	sleepTicks(300)
